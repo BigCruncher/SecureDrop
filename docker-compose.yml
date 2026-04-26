@@ -2,7 +2,17 @@ services:
   ca_setup:
     build: .
     container_name: ca_setup
-    command: ["bash", "/app/ca/generate_ca.sh"]
+    working_dir: /ca
+    command: >
+      bash -c "
+      if [ ! -f ca.key ]; then
+        openssl genpkey -algorithm RSA -out ca.key &&
+        openssl req -x509 -new -key ca.key -sha256 -days 3650
+        -out ca.crt -subj '/CN=SecureDrop Test CA' &&
+        echo 'CA generated.';
+      else
+        echo 'CA already exists, skipping.';
+      fi"
     volumes:
       - ./ca:/ca
 
@@ -15,7 +25,7 @@ services:
     environment:
       - CLIENT_NAME=client1
     volumes:
-      - ./ca:/ca:ro            # CA cert read-only; ca.key also here for sign-on-register
+      - ./ca:/ca            # CA cert read-only; ca.key also here for sign-on-register
       - ./data/client1:/data   # per-client persistent state (users.yaml, contacts.yaml)
     working_dir: /data
     networks: [securenet]
@@ -29,7 +39,7 @@ services:
     environment:
       - CLIENT_NAME=client2
     volumes:
-      - ./ca:/ca:ro            # CA cert read-only; ca.key also here for sign-on-register
+      - ./ca:/ca            # CA cert read-only; ca.key also here for sign-on-register
       - ./data/client2:/data   # per-client persistent state (users.yaml, contacts.yaml)
     working_dir: /data
     networks: [securenet]
@@ -43,7 +53,7 @@ services:
     environment:
       - CLIENT_NAME=client3
     volumes:
-      - ./ca:/ca:ro            # CA cert read-only; ca.key also here for sign-on-register
+      - ./ca:/ca            # CA cert read-only; ca.key also here for sign-on-register
       - ./data/client3:/data   # per-client persistent state (users.yaml, contacts.yaml)
     working_dir: /data
     networks: [securenet]
