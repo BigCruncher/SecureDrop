@@ -5,10 +5,207 @@ from Crypto.Hash import SHA256
 from Crypto.PublicKey import RSA
 from Crypto.Random import get_random_bytes
 from Crypto.Protocol.KDF import PBKDF2
+import subprocess
 import os
 import socket
 import sys
 import yaml
+import ssl
+import json
+import hashlib
+import struct
+
+USERS_FILE = "users.yaml"
+CONTACTS_FILE = "contacts.yaml"
+CA_CERT = "/ca/ca.crt"   # mounted into the container
+CA_KEY  = "/ca/ca.key"   # mounted in for signing CSRs at registration
+
+DISCOVERY_PORT = 8822    # UDP, for broadcasts
+TLS_PORT       = 9999    # TCP, for mutual-TLS connections
+
+def broadcaster():
+    """Periodically broadcast 'I have a TLS server at <host>:<port>'.
+       Identity is proven later via certificate during the TLS handshake."""
+    hostname = socket.gethostname()
+    payload  = f"{hostname}|{TLS_PORT}".encode("utf-8")
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        while True:
+            s.sendto(payload, ("255.255.255.255", DISCOVERY_PORT))
+            time.sleep(3)
+
+peers = {}        # hostname -> {"port": int, "last_seen": float}
+peers_lock = threading.Lock()
+
+def discovery_listener():
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(("0.0.0.0", DISCOVERY_PORT))
+        while True:
+            data, _ = s.recvfrom(1024)
+            try:
+                host, port = data.decode("utf-8").split("|")
+                with peers_lock:
+                    peers[host] = {"port": int(port), "last_seen": time.time()}
+            except Exception:
+                pass
+
+def write_pem_to_disk(session):
+    """ssl.SSLContext.load_cert_chain wants files. Write the in-memory PEMs."""
+    with open("/tmp/me.crt", "wb") as f: f.write(session["certificate_pem"])
+    with open("/tmp/me.key", "wb") as f: f.write(session["privkey_pem"])
+
+def make_server_ctx():
+    ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+    ctx.load_cert_chain(certfile="/tmp/me.crt", keyfile="/tmp/me.key")
+    ctx.load_verify_locations(cafile=CA_CERT)
+    ctx.verify_mode = ssl.CERT_REQUIRED   # peer MUST present a CA-signed cert
+    return ctx
+
+def make_client_ctx():
+    ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile=CA_CERT)
+    ctx.load_cert_chain(certfile="/tmp/me.crt", keyfile="/tmp/me.key")
+    ctx.check_hostname = False   # we identify by cert CN, not hostname
+    return ctx
+
+def peer_email_from_cert(tls_sock) -> str:
+    """Extract CN from the peer's certificate — that's their authenticated email."""
+    cert = tls_sock.getpeercert()
+    for rdn in cert["subject"]:
+        for k, v in rdn:
+            if k == "commonName":
+                return v
+    return ""
+
+def tls_server_loop(session):
+    ctx = make_server_ctx()
+    raw = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    raw.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    raw.bind(("0.0.0.0", TLS_PORT))
+    raw.listen(10)
+    while True:
+        conn, addr = raw.accept()
+        threading.Thread(
+            target=handle_peer,
+            args=(ctx.wrap_socket(conn, server_side=True), session),
+            daemon=True
+        ).start()
+
+def handle_peer(tls_sock, session):
+    """Server side: answer a 'are we mutual contacts?' probe."""
+    try:
+        peer_email = peer_email_from_cert(tls_sock)
+        # Read the request (small, single line of JSON ending in \n)
+        data = b""
+        while not data.endswith(b"\n"):
+            chunk = tls_sock.recv(1024)
+            if not chunk: return
+            data += chunk
+        req = json.loads(data.decode("utf-8").strip())
+
+        if req.get("op") == "check_mutual":
+            contacts = load_contacts(session["password_key"])
+            in_my_list = peer_email in contacts
+            reply = {"in_my_contacts": in_my_list,
+                     "my_email": session["email"],
+                     "my_name": session["name"]}
+            tls_sock.sendall((json.dumps(reply) + "\n").encode("utf-8"))
+        elif req.get("op") == "send_file":
+            # see Milestone 5
+            handle_incoming_file(tls_sock, peer_email, req, session)
+    finally:
+        tls_sock.close()
+
+def list_command(session):
+    """Connect to each broadcast peer over mutual-TLS, ask if we're mutual contacts."""
+    contacts = load_contacts(session["password_key"])
+    online_mutual = []
+
+    with peers_lock:
+        snapshot = [(h, p["port"]) for h, p in peers.items()
+                    if time.time() - p["last_seen"] < 10]
+
+    ctx = make_client_ctx()
+    for host, port in snapshot:
+        try:
+            raw = socket.create_connection((host, port), timeout=3)
+            tls = ctx.wrap_socket(raw)             # mutual-TLS handshake
+            peer_email = peer_email_from_cert(tls)
+
+            # Don't bother if peer isn't even in our contacts
+            if peer_email not in contacts:
+                tls.close(); continue
+
+            req = {"op": "check_mutual"}
+            tls.sendall((json.dumps(req) + "\n").encode("utf-8"))
+            data = b""
+            while not data.endswith(b"\n"):
+                chunk = tls.recv(1024)
+                if not chunk: break
+                data += chunk
+            reply = json.loads(data.decode("utf-8").strip())
+            tls.close()
+
+            if reply.get("in_my_contacts"):
+                online_mutual.append((reply["my_name"], peer_email, host, port))
+        except Exception:
+            continue   # peer not actually reachable / handshake failed / etc.
+
+    if not online_mutual:
+        print("No contacts are currently online.")
+    else:
+        print("The following contacts are online:")
+        for name, email, _, _ in online_mutual:
+            print(f"* {name} <{email}>")
+    return online_mutual   # milestone 5 reuses host/port from this
+
+def handle_incoming_file(tls_sock, peer_email, req, session):
+    contacts = load_contacts(session["password_key"])
+    if peer_email not in contacts:
+        # Project: "From UA on CA to UC on CC, the transfer should not occur"
+        # because UA doesn't have UC as a contact. Silently refuse.
+        tls_sock.sendall(b'{"accept": false, "reason": "not a contact"}\n')
+        return
+
+    filename   = os.path.basename(req["filename"])  # never trust paths from peer
+    size       = int(req["size"])
+    sender_seq = int(req["seq"])
+
+    print(f"\nContact '{contacts[peer_email]['name']} <{peer_email}>' is sending a file. Accept (y/n)? ", end="", flush=True)
+    answer = input().strip().lower()
+    if answer != "y":
+        tls_sock.sendall(b'{"accept": false}\n')
+        return
+
+    my_seq = int.from_bytes(os.urandom(4), "big")
+    tls_sock.sendall((json.dumps({"accept": True, "seq": my_seq}) + "\n").encode())
+
+    # Each chunk is: 4-byte sequence number || 4-byte length || payload
+    received = bytearray()
+    expected_seq = sender_seq + 1
+    while len(received) < size:
+        header = recv_exactly(tls_sock, 8)
+        seq, length = struct.unpack(">II", header)
+        if seq != expected_seq:
+            print("Sequence mismatch — possible replay. Aborting.")
+            return
+        received += recv_exactly(tls_sock, length)
+        expected_seq += 1
+
+    out_path = os.path.join(os.getcwd(), filename)
+    with open(out_path, "wb") as f:
+        f.write(bytes(received))
+    print(f"\nFile saved to {out_path}")
+
+def recv_exactly(sock, n):
+    buf = b""
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise IOError("connection closed")
+        buf += chunk
+    return buf
+
 server_ip = os.getenv('TCP_SERVER_IP', '127.0.0.1')
 server_port = int(os.getenv('TCP_SERVER_PORT', '9999'))
 message = os.getenv('TCP_MESSAGE')
@@ -23,89 +220,81 @@ class user: # a user will map strings to specific data
         self.tag = dictionary["tag"]
         self.ciphertext = dictionary["ciphertext"]
 
-# we will hash the password for security reasons using SHA256 and generate a salt
-def hashpassword(password):
-    salt = os.urandom(16) # generate 16 random bytes and hash it below
-    key = PBKDF2(password, salt, dkLen = 32, count = 1000000, hmac_hash_module = SHA256)
-    return salt.hex(), key.hex()
+##########################################################
+def derive_key(password: str, salt: bytes) -> bytes:
+    """Derive a 32-byte AES key from the password using PBKDF2-HMAC-SHA256."""
+    return PBKDF2(password, salt, dkLen=32, count=200000, hmac_hash_module=SHA256)
 
-# we will verify the password and rehash it to make sure it is authentic
-def verifypassword(salt, password):
-    salt = bytes.fromhex(salt) # reverse the hex on the salt and rehash (below)
-    newhash = PBKDF2(password, salt, dkLen = 32, count = 1000000, hmac_hash_module = SHA256)
-    return newhash.hex(), newhash.hex()
+def encrypt_private_key(privkey_pem: bytes, password: str):
+    """Encrypt the user's private key with a key derived from their password.
+       Returns (salt_hex, nonce_hex, tag_hex, ciphertext_hex)."""
+    salt = get_random_bytes(16)
+    key  = derive_key(password, salt)
+    cipher = AES.new(key, AES.MODE_EAX)
+    ct, tag = cipher.encrypt_and_digest(privkey_pem)
+    return salt.hex(), cipher.nonce.hex(), tag.hex(), ct.hex()
 
-# in case no public or private keys exist we will generate them with this function
-def generate_keys():
-    key = RSA.generate(2048) # 2048-bit key
-    private_key = key.export_key() # export it as a private key and write it to file
-    with open("private.pem", "wb") as f: f.write(private_key)
-    public_key = key.publickey().export_key() # do the same for a public key
-    with open("public.pem", "wb") as f: f.write(public_key)
-    print("Generated private and public keys successfully.")
+def sign_csr_with_ca(csr_path: str, out_cert_path: str):
+    """Use the local CA to sign a CSR and produce a user certificate.
+       Educational shortcut — in real PKI the CA lives elsewhere."""
+    subprocess.run([
+        "openssl", "x509", "-req", "-in", csr_path,
+        "-CA", CA_CERT, "-CAkey", CA_KEY, "-CAcreateserial",
+        "-out", out_cert_path, "-days", "365", "-sha256"
+    ], check=True, capture_output=True)
+##############################################################
 
-# we will encrypt (and decrypt) information about the user using PGP which involves AES and RSA
-def encryptinfo(password, email, name):
-    try:
-        pubkey = RSA.importKey(open("public.pem").read()) # read the public key
-        data = f"{password}|{email}|{name}".encode('utf-8')
-        AESKey = get_random_bytes(16)
-        AESCipher = AES.new(AESKey, AES.MODE_EAX) # generate an AES cipher to encrypt text
-        ciphertext, tag = AESCipher.encrypt_and_digest(data) # encrypt the ciphertext using the data
-        RSACipher = PKCS1_OAEP.new(pubkey) # generate an RSA Cipher and use it to encrypt the AES key
-        encryptedAESKey = RSACipher.encrypt(AESKey) # encrypt the AES key using RSA
-        return {
-            "encryptedAESKey": encryptedAESKey.hex(),
-            "nonce": AESCipher.nonce.hex(),
-            "tag": tag.hex(),
-            "ciphertext": ciphertext.hex()
-        } # this is an entry
-    except Exception as e:
-        print(f"Encryption failed: {e}")
-
-# we will encrypt (and decrypt) information about the user using PGP which involves AES and RSA
-def decryptinfo(encryptedDictionary):
-    try:
-        privatekey = RSA.importKey(open("private.pem").read())
-        # reverse the hex from the values and then obtain the mapped values
-        encryptedAESKey =  bytes.fromhex(encryptedDictionary["encryptedAESKey"])
-        nonce =  bytes.fromhex(encryptedDictionary["nonce"])
-        tag =  bytes.fromhex(encryptedDictionary["tag"])
-        ciphertext =  bytes.fromhex(encryptedDictionary["ciphertext"])
-        RSACipher = PKCS1_OAEP.new(privatekey) # obtain an RSA cipher with private key
-        AESKey = RSACipher.decrypt(encryptedAESKey) # use it to decrypt AES key
-        AESCipher = AES.new(AESKey, AES.MODE_EAX, nonce) # generate an AES cipher to decrypt text
-        data = AESCipher.decrypt_and_verify(ciphertext, tag) # decrypt the data and decode it below
-        decryptedString = data.decode("utf-8")
-        password, email, name = decryptedString.split("|") # remove a separator from the data
-        return name, email, password # return the decrypted information
-    except Exception as e:
-        print(f"Decryption failed: {e}")
-
-# the user will register once and generate his/her private key if none exists
 def register():
-    if not os.path.exists("private.pem"): generate_keys() # generate keys if they do not exist
-    fn = input("Enter full name: ")
-    ea = input("Enter email address: ")
-    password = input("Enter a password: ")
-    password2 = input("Enter a password: ")
-    if password != password2:
+    if os.path.exists(USERS_FILE) and os.path.getsize(USERS_FILE) > 0:
+        print("A user is already registered on this client.")
+        return
+
+    name  = input("Enter Full Name: ").strip()
+    email = input("Enter Email Address: ").strip()
+    p1 = input("Enter Password: ")
+    p2 = input("Re-enter Password: ")
+    if p1 != p2:
         print("Passwords do not match.")
         return
-    salt, hashpass = hashpassword(password)
-    newUser = {
-        "Name": fn,
-        "Email": ea,
-        "Salt": salt,
-        "Hash": hashpass
-    } # new user information (map)
-    users = {"users": []} # new map with entries
-    if os.path.exists("users.yaml") and os.stat("users.yaml").st_size > 0:
-        with open("users.yaml", "r") as f:
-            users = yaml.safe_load(f) or {"users": []} # handle empty and nonempty file cases
-    users["users"].append(newUser) # now add the new user to the map
-    with open("users.yaml", "w") as f:
-        yaml.dump(users, f) # dump it in the YAML file
+    print("Passwords Match.")
+
+    # 1. Generate the user's keypair
+    key = RSA.generate(2048)
+    privkey_pem = key.export_key()
+    pubkey_pem  = key.publickey().export_key()
+
+    # 2. Write the private key to a temp file so openssl can read it for the CSR
+    with open("user.key", "wb") as f:
+        f.write(privkey_pem)
+    # 3. Build a CSR with CN = email (this is what mutual-TLS will check)
+    subprocess.run([
+        "openssl", "req", "-new", "-key", "user.key", "-out", "user.csr",
+        "-subj", f"/CN={email}"
+    ], check=True, capture_output=True)
+    # 4. Have the CA sign it
+    sign_csr_with_ca("user.csr", "user.crt")
+
+    with open("user.crt", "rb") as f:
+        cert_pem = f.read()
+    os.remove("user.csr")  # not needed afterwards
+    os.remove("user.key")  # plaintext private key never stays on disk
+
+    # 5. Encrypt the private key with a password-derived key
+    salt_h, nonce_h, tag_h, ct_h = encrypt_private_key(privkey_pem, p1)
+
+    record = {
+        "users": [{
+            "name": name,
+            "email": email,
+            "salt": salt_h,
+            "enc_privkey": {"nonce": nonce_h, "tag": tag_h, "ciphertext": ct_h},
+            "certificate": cert_pem.decode("utf-8"),
+            "public_key": pubkey_pem.decode("utf-8"),
+        }]
+    }
+    with open(USERS_FILE, "w") as f:
+        yaml.dump(record, f)
+
     print("Finished registration.")
 
 # the server will start below and allow listening and acceptance of connections
@@ -140,30 +329,39 @@ def broadcast(user):
             s.sendto(payload.encode("utf-8"), ("255.255.255.255", 8822))
             time.sleep(5)
 
-# with this function a new contact will be added. Contact info will be securely stored and encrypted/decrypted using PGP also.
-def add():
-    fn = input("Enter recipient's full name: ")
-    ea = input("Enter recipient's email address: ")
-    pubkey_path = input("Enter recipient's public key file path: ")
-    try:
-        with open(pubkey_path, "r") as f: pubkey_data = f.read()
-    except:
-        print("Could not read public key file.")
-        return
-    encryptedData = encryptinfo("NA", ea, fn)
-    if encryptedData is None:
-        print("Failed to encrypt contact info.")
-        return
-    contacts = {}
-    if os.path.exists("contacts.yaml") and os.stat("contacts.yaml").st_size > 0:
-        with open("contacts.yaml", "r") as f:
-            contacts = yaml.safe_load(f) or {}
-    contacts[ea] = {
-        "info": encryptedData,
-        "public_key": pubkey_data
-    }
-    with open("contacts.yaml", "w") as f: yaml.dump(contacts, f)
-    print("Added contact.")
+def encrypt_blob(plaintext: bytes, key: bytes) -> dict:
+    cipher = AES.new(key, AES.MODE_EAX)
+    ct, tag = cipher.encrypt_and_digest(plaintext)
+    return {"nonce": cipher.nonce.hex(), "tag": tag.hex(), "ciphertext": ct.hex()}
+
+def decrypt_blob(blob: dict, key: bytes) -> bytes:
+    cipher = AES.new(key, AES.MODE_EAX, nonce=bytes.fromhex(blob["nonce"]))
+    return cipher.decrypt_and_verify(
+        bytes.fromhex(blob["ciphertext"]),
+        bytes.fromhex(blob["tag"])
+    )
+
+def load_contacts(password_key: bytes) -> dict:
+    if not os.path.exists(CONTACTS_FILE) or os.path.getsize(CONTACTS_FILE) == 0:
+        return {}
+    with open(CONTACTS_FILE, "r") as f:
+        blob = yaml.safe_load(f)
+    raw = decrypt_blob(blob, password_key)
+    return yaml.safe_load(raw) or {}
+
+def save_contacts(contacts: dict, password_key: bytes):
+    raw = yaml.dump(contacts).encode("utf-8")
+    blob = encrypt_blob(raw, password_key)
+    with open(CONTACTS_FILE, "w") as f:
+        yaml.dump(blob, f)
+
+def add(session):
+    name  = input("Enter Full Name: ").strip()
+    email = input("Enter Email Address: ").strip()
+    contacts = load_contacts(session["password_key"])
+    contacts[email] = {"name": name}   # overwrite if exists, per project spec
+    save_contacts(contacts, session["password_key"])
+    print("Contact Added.")
 
 # the user will be able to send the file across to someone else and the data will be encoded.
 def send(filepath, contact, current_user):
@@ -258,25 +456,47 @@ def listenForUsers():
                 print(f"UDP parse error: {e}")
 # here the user will enter the credentials which will be verified with SHA256 hashing
 def login():
-    with open("users.yaml", "r") as f:
-        data = yaml.safe_load(f)
-    if not data or "users" not in data:
-        print("No users are registered.")
+    if not os.path.exists(USERS_FILE) or os.path.getsize(USERS_FILE) == 0:
+        print("No users are registered with this client.")
         return None
-    attempts = 0
-    while attempts < 3: # handle many attempts
-        email = input("Enter your email address: ")
-        password = input("Enter your password: ")
-        for user in data["users"]:
-            salt = bytes.fromhex(user["Salt"])
-            hashpass = user["Hash"] # obtain the hash and rehash to get original;
-            newhash = PBKDF2(password, salt, dkLen = 32, count = 1000000, hmac_hash_module = SHA256)
-            if email == user["Email"] and newhash.hex() == hashpass: # if it's a match success
-                print("Welcome to SecureDrop.")
-                return user # return user that just logged in
-        print("Invalid email/password.")
-        attempts += 1
-    sys.exit(1)
+
+    with open(USERS_FILE, "r") as f:
+        users = yaml.safe_load(f).get("users", [])
+
+    while True:
+        email = input("Enter Email Address: ").strip()
+        password = input("Enter Password: ")
+
+        # Find user record by email; same generic error whether email or password is wrong
+        record = next((u for u in users if u["email"] == email), None)
+        if record is None or password == "":
+            print("Email and Password Combination Invalid.")
+            continue
+
+        # Try to decrypt the private key. If it works, password is correct.
+        salt = bytes.fromhex(record["salt"])
+        key  = derive_key(password, salt)
+        ek   = record["enc_privkey"]
+        cipher = AES.new(key, AES.MODE_EAX, nonce=bytes.fromhex(ek["nonce"]))
+        try:
+            privkey_pem = cipher.decrypt_and_verify(
+                bytes.fromhex(ek["ciphertext"]),
+                bytes.fromhex(ek["tag"])
+            )
+        except ValueError:
+            # Wrong password -> AES-EAX tag check fails
+            print("Email and Password Combination Invalid.")
+            continue
+
+        print("Welcome to SecureDrop.")
+        # Return everything the rest of the session will need in memory
+        return {
+            "name": record["name"],
+            "email": record["email"],
+            "privkey_pem": privkey_pem,             # plaintext bytes, in-memory only
+            "certificate_pem": record["certificate"].encode(),
+            "password_key": key,                    # for encrypting contacts.yaml
+        }
 
 # to make sure we send to someone online we will use this
 def findContact(identifier):
