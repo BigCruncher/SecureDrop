@@ -1,0 +1,24 @@
+services:
+  client1:
+    build: .
+    container_name: client1
+    stdin_open: true
+    tty: true
+    environment:
+      - CLIENT_NAME=client1
+
+  client2:
+    build: .
+    container_name: client2
+    stdin_open: true
+    tty: true
+    environment:
+      - CLIENT_NAME=client2
+
+  client3:
+    build: .
+    container_name: client3
+    stdin_open: true
+    tty: true
+    environment:
+      - CLIENT_NAME=client3
