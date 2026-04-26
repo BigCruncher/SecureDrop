@@ -1,24 +1,53 @@
 services:
+  ca_setup:
+    build: .
+    container_name: ca_setup
+    command: ["bash", "/app/ca/generate_ca.sh"]
+    volumes:
+      - ./ca:/ca
+
   client1:
     build: .
     container_name: client1
     stdin_open: true
     tty: true
+    depends_on: [ca_setup]
     environment:
       - CLIENT_NAME=client1
+    volumes:
+      - ./ca:/ca:ro            # CA cert read-only; ca.key also here for sign-on-register
+      - ./data/client1:/data   # per-client persistent state (users.yaml, contacts.yaml)
+    working_dir: /data
+    networks: [securenet]
 
   client2:
     build: .
     container_name: client2
     stdin_open: true
     tty: true
+    depends_on: [ca_setup]
     environment:
       - CLIENT_NAME=client2
+    volumes:
+      - ./ca:/ca:ro            # CA cert read-only; ca.key also here for sign-on-register
+      - ./data/client2:/data   # per-client persistent state (users.yaml, contacts.yaml)
+    working_dir: /data
+    networks: [securenet]
 
   client3:
     build: .
     container_name: client3
     stdin_open: true
     tty: true
+    depends_on: [ca_setup]
     environment:
       - CLIENT_NAME=client3
+    volumes:
+      - ./ca:/ca:ro            # CA cert read-only; ca.key also here for sign-on-register
+      - ./data/client3:/data   # per-client persistent state (users.yaml, contacts.yaml)
+    working_dir: /data
+    networks: [securenet]
+
+networks:
+  securenet:
+    driver: bridge
