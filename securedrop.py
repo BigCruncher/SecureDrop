@@ -235,13 +235,20 @@ def encrypt_private_key(privkey_pem: bytes, password: str):
     return salt.hex(), cipher.nonce.hex(), tag.hex(), ct.hex()
 
 def sign_csr_with_ca(csr_path: str, out_cert_path: str):
-    """Use the local CA to sign a CSR and produce a user certificate.
-       Educational shortcut — in real PKI the CA lives elsewhere."""
-    subprocess.run([
+    """Use the local CA to sign a CSR. Surfaces openssl's own error on failure."""
+    result = subprocess.run([
         "openssl", "x509", "-req", "-in", csr_path,
         "-CA", CA_CERT, "-CAkey", CA_KEY, "-CAcreateserial",
         "-out", out_cert_path, "-days", "365", "-sha256"
-    ], check=True, capture_output=True)
+    ], capture_output=True, text=True)
+    if result.returncode != 0:
+        print("---- openssl stderr ----")
+        print(result.stderr)
+        print("---- openssl stdout ----")
+        print(result.stdout)
+        raise RuntimeError(
+            f"openssl x509 signing failed (exit {result.returncode})"
+        )
 ##############################################################
 
 def register():
@@ -421,23 +428,6 @@ def encryptFileConents(filepath, recipient_pubkey):
         print(e)
         return None
 
-# we will decrypt our received files using private key
-def decryptFileContents(filepath):
-    try:
-        privatekey = RSA.importKey(open("private.pem").read()) # open the private key
-        with open(filepath, "rb") as f: data = yaml.safe_load(f) # load the file info
-        encryptedAESKey = bytes.fromhex(data["key"]) # get the encrypted AES key so we can decrypt it with RSA
-        nonce = bytes.fromhex(data["nonce"])
-        tag = bytes.fromhex(data["tag"])
-        ciphertext = bytes.fromhex(data["data"])
-        RSACipher = PKCS1_OAEP.new(privatekey)
-        AESKey = RSACipher.decrypt(encryptedAESKey)
-        AESCipher = AES.new(AESKey, AES.MODE_EAX, nonce)
-        data = AESCipher.decrypt_and_verify(ciphertext, tag)
-        with open("decrypted_output", "wb") as f: f.write(data)
-    except Exception as e:
-        print(f"Decryption failed: {e}")
-
 # in order to find people on the network we will listen and establish a UDP socket for it
 def listenForUsers():
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp_socket:
@@ -558,9 +548,9 @@ if not os.path.exists("users.yaml") or os.stat("users.yaml").st_size == 0:
 else:
     logged_in_user = login()
     if logged_in_user:
-        # a few daemons that start broadcasting, listening, and server services
-        threading.Thread(target=broadcast, args=(logged_in_user,), daemon=True).start()
-        threading.Thread(target=startServer, daemon=True).start()
-        threading.Thread(target=listenForUsers, daemon=True).start()
+        write_pem_to_disk(logged_in_user)   # need this so the TLS contexts can load
+        threading.Thread(target=broadcaster, daemon=True).start()
+        threading.Thread(target=discovery_listener, daemon=True).start()
+        threading.Thread(target=tls_server_loop, args=(logged_in_user,), daemon=True).start()
         while True:
-            getInput()
+            getInput(logged_in_user)        # getInput needs the session now
