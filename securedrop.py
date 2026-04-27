@@ -26,7 +26,8 @@ TLS_PORT       = 9999    # TCP, for mutual-TLS connections
 def broadcaster():
     """Periodically broadcast 'I have a TLS server at <host>:<port>'.
        Identity is proven later via certificate during the TLS handshake."""
-    hostname = socket.gethostname()
+    #hostname = socket.gethostname()
+    hostname = os.getenv("CLIENT_NAME", socket.gethostname())
     payload  = f"{hostname}|{TLS_PORT}".encode("utf-8")
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
         s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
@@ -38,6 +39,7 @@ peers = {}        # hostname -> {"port": int, "last_seen": float}
 peers_lock = threading.Lock()
 
 def discovery_listener():
+    hostname = os.getenv("CLIENT_NAME", socket.gethostname())
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         s.bind(("0.0.0.0", DISCOVERY_PORT))
@@ -45,6 +47,8 @@ def discovery_listener():
             data, _ = s.recvfrom(1024)
             try:
                 host, port = data.decode("utf-8").split("|")
+                if host == hostname:
+                    continue            # ignore our own broadcast
                 with peers_lock:
                     peers[host] = {"port": int(port), "last_seen": time.time()}
             except Exception:
@@ -86,38 +90,58 @@ def tls_server_loop(session):
     while True:
         conn, addr = raw.accept()
         threading.Thread(
-            target=handle_peer,
-            args=(ctx.wrap_socket(conn, server_side=True), session),
+            target=serve_one_connection,
+            args=(ctx, conn, session),
             daemon=True
         ).start()
 
+def serve_one_connection(ctx, conn, session):
+    """Wrap-and-handle on a worker thread so a slow handshake can't block accept()."""
+    try:
+        tls_sock = ctx.wrap_socket(conn, server_side=True)
+    except (ssl.SSLError, OSError):
+        # Bad handshake — peer wasn't trusted, or connection died. Just drop it.
+        try: conn.close()
+        except Exception: pass
+        return
+    handle_peer(tls_sock, session)
+
 def handle_peer(tls_sock, session):
-    """Server side: answer a 'are we mutual contacts?' probe."""
+    """Server side: answer a 'are we mutual contacts?' probe.
+    Peers may disconnect at any time; that's not an error worth surfacing."""
     try:
         peer_email = peer_email_from_cert(tls_sock)
-        # Read the request (small, single line of JSON ending in \n)
         data = b""
         while not data.endswith(b"\n"):
             chunk = tls_sock.recv(1024)
-            if not chunk: return
+            if not chunk:
+                return
             data += chunk
         req = json.loads(data.decode("utf-8").strip())
 
         if req.get("op") == "check_mutual":
             contacts = load_contacts(session["password_key"])
-            in_my_list = peer_email in contacts
-            reply = {"in_my_contacts": in_my_list,
+            reply = {"in_my_contacts": peer_email in contacts,
                      "my_email": session["email"],
                      "my_name": session["name"]}
             tls_sock.sendall((json.dumps(reply) + "\n").encode("utf-8"))
         elif req.get("op") == "send_file":
-            # see Milestone 5
             handle_incoming_file(tls_sock, peer_email, req, session)
+    except OSError:
+        # Covers BrokenPipeError, ConnectionResetError, ssl.SSLError —
+        # all variations of "peer went away mid-conversation". Drop quietly.
+        pass
+    except Exception as e:
+        # An actual bug (JSON parse error, KeyError, etc.) — show it.
+        print(f"handle_peer error: {type(e).__name__}: {e}")
     finally:
-        tls_sock.close()
+        try:
+            tls_sock.close()
+        except Exception:
+            pass
 
 def list_command(session):
-    """Connect to each broadcast peer over mutual-TLS, ask if we're mutual contacts."""
+    """Connect to each broadcast peer over mutual-TLS; show only mutual contacts."""
     contacts = load_contacts(session["password_key"])
     online_mutual = []
 
@@ -129,35 +153,38 @@ def list_command(session):
     for host, port in snapshot:
         try:
             raw = socket.create_connection((host, port), timeout=3)
-            tls = ctx.wrap_socket(raw)             # mutual-TLS handshake
+            tls = ctx.wrap_socket(raw)
             peer_email = peer_email_from_cert(tls)
 
-            # Don't bother if peer isn't even in our contacts
-            if peer_email not in contacts:
-                tls.close(); continue
-
-            req = {"op": "check_mutual"}
-            tls.sendall((json.dumps(req) + "\n").encode("utf-8"))
+            # Always complete the protocol — even if we'll filter the peer out.
+            # Closing mid-handshake gives the peer a BrokenPipeError on its server thread.
+            tls.sendall((json.dumps({"op": "check_mutual"}) + "\n").encode("utf-8"))
             data = b""
             while not data.endswith(b"\n"):
                 chunk = tls.recv(1024)
-                if not chunk: break
+                if not chunk:
+                    break
                 data += chunk
-            reply = json.loads(data.decode("utf-8").strip())
             tls.close()
 
-            if reply.get("in_my_contacts"):
-                online_mutual.append((reply["my_name"], peer_email, host, port))
+            if not data:
+                continue
+            reply = json.loads(data.decode("utf-8").strip())
+
+            # Mutual = I have them AND they have me.
+            if peer_email in contacts and reply.get("in_my_contacts"):
+                online_mutual.append((reply["my_name"], peer_email))
+        except OSError:
+            continue   # peer unreachable / handshake failed
         except Exception:
-            continue   # peer not actually reachable / handshake failed / etc.
+            continue
 
     if not online_mutual:
         print("No contacts are currently online.")
     else:
         print("The following contacts are online:")
-        for name, email, _, _ in online_mutual:
+        for name, email in online_mutual:
             print(f"* {name} <{email}>")
-    return online_mutual   # milestone 5 reuses host/port from this
 
 def handle_incoming_file(tls_sock, peer_email, req, session):
     contacts = load_contacts(session["password_key"])
@@ -206,7 +233,7 @@ def recv_exactly(sock, n):
         buf += chunk
     return buf
 
-commandlist = ["add", "list", "send", "exit", "help"]
+commandlist = ["add", "list", "send", "exit", "help", "peers"]
 
 def derive_key(password: str, salt: bytes) -> bytes:
     """Derive a 32-byte AES key from the password using PBKDF2-HMAC-SHA256."""
@@ -484,6 +511,13 @@ def getInput(session):
             send_command(session, parts[1], parts[2])
         except Exception as e:
             print(f"send failed: {e}")
+    elif cmd == "peers":
+        with peers_lock:
+            if not peers:
+                print("(no peers seen yet)")
+            for host, info in peers.items():
+                age = time.time() - info["last_seen"]
+                print(f"  {host}:{info['port']}  (last seen {age:.1f}s ago)")
 
 
 # ----- Entry point -----
