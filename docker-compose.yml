@@ -3,16 +3,18 @@ services:
     build: .
     container_name: ca_setup
     working_dir: /ca
-    command: >
-      bash -c "
-      if [ ! -f ca.key ]; then
-        openssl genpkey -algorithm RSA -out ca.key &&
-        openssl req -x509 -new -key ca.key -sha256 -days 3650
-        -out ca.crt -subj '/CN=SecureDrop Test CA' &&
-        echo 'CA generated.';
-      else
-        echo 'CA already exists, skipping.';
-      fi"
+    command:
+      - bash
+      - -c
+      - |
+        if [ ! -f ca.key ]; then
+          openssl genpkey -algorithm RSA -out ca.key && \
+          openssl req -x509 -new -key ca.key -sha256 -days 3650 \
+            -out ca.crt -subj '/CN=SecureDrop Test CA' && \
+          echo 'CA generated.'
+        else
+          echo 'CA already exists, skipping.'
+        fi
     volumes:
       - ./ca:/ca
 
