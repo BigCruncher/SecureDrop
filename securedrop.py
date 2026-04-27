@@ -206,21 +206,8 @@ def recv_exactly(sock, n):
         buf += chunk
     return buf
 
-server_ip = os.getenv('TCP_SERVER_IP', '127.0.0.1')
-server_port = int(os.getenv('TCP_SERVER_PORT', '9999'))
-message = os.getenv('TCP_MESSAGE')
 commandlist = ["add", "list", "send", "exit", "help"]
-contact_count = 0
-hostname = os.getenv("CLIENT_NAME", socket.gethostname())
-online_people = {} # who is online
-class user: # a user will map strings to specific data
-    def __init__(self, dictionary):
-        self.encryptedAESKey = dictionary["encryptedAESKey"]
-        self.nonce = dictionary["nonce"]
-        self.tag = dictionary["tag"]
-        self.ciphertext = dictionary["ciphertext"]
 
-##########################################################
 def derive_key(password: str, salt: bytes) -> bytes:
     """Derive a 32-byte AES key from the password using PBKDF2-HMAC-SHA256."""
     return PBKDF2(password, salt, dkLen=32, count=200000, hmac_hash_module=SHA256)
@@ -249,7 +236,6 @@ def sign_csr_with_ca(csr_path: str, out_cert_path: str):
         raise RuntimeError(
             f"openssl x509 signing failed (exit {result.returncode})"
         )
-##############################################################
 
 def register():
     if os.path.exists(USERS_FILE) and os.path.getsize(USERS_FILE) > 0:
@@ -304,38 +290,6 @@ def register():
 
     print("Finished registration.")
 
-# the server will start below and allow listening and acceptance of connections
-def startServer():
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(('0.0.0.0', 9999)) # bind and liston on all interfaces
-        s.listen()
-        while True:
-            conn, address = s.accept() # accept connections and receive info (4096 bits) further
-            with conn:
-                data = b""
-                while True:
-                    chunk = conn.recv(4096)
-                    if not chunk: # no data, break
-                        break
-                    data += chunk # the data received includes that chunk otherwise
-                filename = "receivedfile.pgp"
-                with open(filename, "wb") as f:
-                    f.write(data)
-                print(f"Received file from: {address}")
-                decryptFileContents(filename)
-                conn.sendall(b"ACK") # send the acknowledgement that the info was received
-
-# the user will be able to be seen and heard from with the function below
-def broadcast(user):
-    email = user["Email"]
-    hostname = os.getenv("CLIENT_NAME", socket.gethostname())
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        while True:
-            payload = f"{email}|{hostname}"
-            s.sendto(payload.encode("utf-8"), ("255.255.255.255", 8822))
-            time.sleep(5)
-
 def encrypt_blob(plaintext: bytes, key: bytes) -> dict:
     cipher = AES.new(key, AES.MODE_EAX)
     ct, tag = cipher.encrypt_and_digest(plaintext)
@@ -370,80 +324,6 @@ def add(session):
     save_contacts(contacts, session["password_key"])
     print("Contact Added.")
 
-# the user will be able to send the file across to someone else and the data will be encoded.
-def send(filepath, contact, current_user):
-    email = contact["Email"]
-    if email not in online_people:
-        print(f"Contact {email} is not online.")
-        return
-    password = input("Enter your password: ")
-    salt = bytes.fromhex(current_user["Salt"])
-    hashpass = current_user["Hash"]
-    newhash = PBKDF2(password, salt, dkLen = 32, count = 1000000, hmac_hash_module = SHA256)
-    if newhash.hex() != hashpass: # see if the hash matches the one on file
-        print("Entry incorrect; access denied.")
-        return
-    host = online_people[email]["host"]
-    try:
-        recipient_pubkey = contact["Data"]["public_key"] # find the recipient's public key so we can use ot
-        data = encryptFileConents(filepath, recipient_pubkey)
-        if data is None: return
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as tcp_socket:
-            tcp_socket.settimeout(10)
-            tcp_socket.connect((host, 9999))
-            tcp_socket.sendall(data.encode("utf-8"))
-            try:
-                response = tcp_socket.recv(1024)
-                if response == b"ACK":
-                    print(f"File successfully received by: {email}")
-                else:
-                    print(f"Unexpected response from {email}: {response}")
-            except socket.timeout:
-                print(f"No confirmation from {email}")
-    except Exception as e:
-        print(f"Unable to send to {contact}: {e}")
-
-# before sending the file contents will be encrypted with PGP
-def encryptFileConents(filepath, recipient_pubkey):
-    try:
-        with open(filepath, "rb") as f:
-            data = f.read()
-        pubkey = RSA.importKey(recipient_pubkey)
-        AESKey = get_random_bytes(16)
-        AESCipher = AES.new(AESKey, AES.MODE_EAX)
-        ciphertext, tag = AESCipher.encrypt_and_digest(data)
-        RSACipher = PKCS1_OAEP.new(pubkey)
-        encryptedAESKey = RSACipher.encrypt(AESKey)
-        data = {
-            "key": encryptedAESKey.hex(),
-            "nonce": AESCipher.nonce.hex(),
-            "tag": tag.hex(),
-            "data": ciphertext.hex()
-        }
-        return yaml.dump(data)
-    except FileNotFoundError:
-        print("File does not exist: " + filepath)
-        return None
-    except Exception as e:
-        print(e)
-        return None
-
-# in order to find people on the network we will listen and establish a UDP socket for it
-def listenForUsers():
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp_socket:
-        udp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        udp_socket.bind(("0.0.0.0", 8822))
-        while True:
-            data, address = udp_socket.recvfrom(1024)
-            try:
-                payload = data.decode("utf-8")
-                email, host = payload.split("|")
-                online_people[email] = {
-                    "host": host,
-                    "last_seen": time.time()
-                }
-            except Exception as e:
-                print(f"UDP parse error: {e}")
 # here the user will enter the credentials which will be verified with SHA256 hashing
 def login():
     if not os.path.exists(USERS_FILE) or os.path.getsize(USERS_FILE) == 0:
@@ -488,69 +368,142 @@ def login():
             "password_key": key,                    # for encrypting contacts.yaml
         }
 
-# to make sure we send to someone online we will use this
-def findContact(identifier):
-    if not os.path.exists("contacts.yaml"): return None
-    with open("contacts.yaml", "r") as f: contactData = yaml.safe_load(f) or {}
-    if identifier in contactData: return {"Email": identifier, "Data": contactData[identifier]}
-    for email, fullData in contactData.items():
-        try:
-            decryptedName, _, _ = decryptinfo(fullData["info"])
-            if decryptedName.lower() == identifier.lower(): return {"Email": email, "Data": fullData}
-        except: continue
-    return None
-
-# gets the user input
-def getInput():
-    global message
-    entry = input("secure_drop> ").strip()
-    if not entry: return
-    firstArg = entry.split()[0]
-    if firstArg not in commandlist:
-        print("Invalid command: " + firstArg)
+def send_command(session, contact_email, filepath):
+    """Sender side of file transfer. Mutual-TLS auth + replay-resistant chunks."""
+    if not os.path.isfile(filepath):
+        print(f"File not found: {filepath}")
         return
-    elif entry == "exit": sys.exit(1)
-    elif entry == "add": add()
-    elif entry == "list":
-        if not os.path.exists("contacts.yaml"):
-            print("Contacts file does not exist.")
-        else:
-            with open("contacts.yaml", "r") as f:
-                contacts = yaml.safe_load(f) or {}
-                for email, encryptedData in contacts.items():
-                    try:
-                        name, _, _ = decryptinfo(encryptedData["info"]) # safely retrieve the decrypted info
-                        status = "ONLINE" if email in online_people else "OFFLINE"
-                        print(f"Name: {name} | Email: {email} | {status}")
-                    except: print(f"Could not decrypt {email}")
-    elif entry.startswith("send"):
-        parts = entry.split() # split the command into a tuple of elements
-        if len(parts) == 3:
-            name = parts[1] # the recipient's name
-            filepath = parts[2] # where the file lives
-            contactDictionary = findContact(name)
-            if contactDictionary: # now try to find the contact and see if it exists; if so send!
-                send(filepath, contactDictionary, logged_in_user)
-            else: print(f"User {name} is not online or is not in your contact list.")
-        else: print("Usage send <contact> <filepath>")
-    elif entry == "help" or entry == "Help": # print list of available commands
-        print("The following commands are available:")
-        print("*** add: add a new contact to list of registered contacts.")
-        print("*** list: show all registered contacts.")
-        print("*** send: send a message to an email address.")
-        print("*** help: display this message.")
-        print("*** exit: exit the application.")
 
-if not os.path.exists("users.yaml") or os.stat("users.yaml").st_size == 0:
+    contacts = load_contacts(session["password_key"])
+    if contact_email not in contacts:
+        # Project scenario 9: UA -> UC where UA doesn't have UC -> "transfer should not occur"
+        print(f"{contact_email} is not in your contact list.")
+        return
+
+    # Walk the discovery snapshot looking for a peer whose cert CN matches contact_email
+    with peers_lock:
+        snapshot = [(h, p["port"]) for h, p in peers.items()
+                    if time.time() - p["last_seen"] < 10]
+
+    ctx = make_client_ctx()
+    target = None
+    for host, port in snapshot:
+        try:
+            raw = socket.create_connection((host, port), timeout=3)
+            tls = ctx.wrap_socket(raw)
+            if peer_email_from_cert(tls) == contact_email:
+                target = tls
+                break
+            tls.close()                          # wrong peer; try the next one
+        except Exception:
+            continue
+
+    if target is None:
+        print(f"{contact_email} is not online.")
+        return
+
+    try:
+        size   = os.path.getsize(filepath)
+        my_seq = int.from_bytes(os.urandom(4), "big")
+        req = {
+            "op":       "send_file",
+            "filename": os.path.basename(filepath),
+            "size":     size,
+            "seq":      my_seq,
+        }
+        target.sendall((json.dumps(req) + "\n").encode("utf-8"))
+
+        # Wait for accept/reject (single line of JSON)
+        data = b""
+        while not data.endswith(b"\n"):
+            chunk = target.recv(1024)
+            if not chunk:
+                print("Peer closed connection before responding.")
+                return
+            data += chunk
+        reply = json.loads(data.decode("utf-8").strip())
+        if not reply.get("accept"):
+            print(f"Transfer rejected: {reply.get('reason', 'declined by user')}")
+            return
+
+        print("Contact has accepted the transfer request.")
+
+        # Stream the file in 64 KB chunks. Each chunk: 4-byte seq || 4-byte len || payload.
+        seq = my_seq + 1
+        with open(filepath, "rb") as f:
+            while True:
+                chunk = f.read(65536)
+                if not chunk:
+                    break
+                target.sendall(struct.pack(">II", seq, len(chunk)) + chunk)
+                seq += 1
+        print("File has been successfully transferred.")
+    finally:
+        target.close()
+
+
+def getInput(session):
+    """Read a single command from the user and dispatch it."""
+    try:
+        entry = input("secure_drop> ").strip()
+    except EOFError:
+        sys.exit(0)
+    if not entry:
+        return
+
+    parts = entry.split()
+    cmd   = parts[0]
+
+    # Scenario 6: unknown commands must NOT crash or exit
+    if cmd not in commandlist:
+        print(f"Unknown command: {cmd}")
+        return
+
+    if cmd == "exit":
+        sys.exit(0)
+    elif cmd == "help":
+        print('"add"  -> Add a new contact')
+        print('"list" -> List all online contacts')
+        print('"send" -> Transfer file to contact')
+        print('"exit" -> Exit SecureDrop')
+    elif cmd == "add":
+        try:
+            add(session)
+        except Exception as e:
+            print(f"add failed: {e}")
+    elif cmd == "list":
+        try:
+            list_command(session)
+        except Exception as e:
+            print(f"list failed: {e}")
+    elif cmd == "send":
+        if len(parts) != 3:
+            print("Usage: send <email> <filepath>")
+            return
+        try:
+            send_command(session, parts[1], parts[2])
+        except Exception as e:
+            print(f"send failed: {e}")
+
+
+# ----- Entry point -----
+if not os.path.exists(USERS_FILE) or os.path.getsize(USERS_FILE) == 0:
     print("No users are registered with this client.")
-    choice = input("Do you want to register a new user? (y/n): ")
-    if choice.lower() == "y": register()
+    choice = input("Do you want to register a new user (y/n)? ")
+    if choice.lower() == "y":
+        register()
+    print("Exiting SecureDrop.")
 else:
-    logged_in_user = login()
-    if logged_in_user:
-        write_pem_to_disk(logged_in_user)   # need this so the TLS contexts can load
-        threading.Thread(target=broadcaster, daemon=True).start()
-        threading.Thread(target=discovery_listener, daemon=True).start()
-        threading.Thread(target=tls_server_loop, args=(logged_in_user,), daemon=True).start()
+    session = login()
+    if session is not None:
+        # Persist cert + key to /tmp so the SSL contexts can load them as files.
+        # These are wiped when the container stops; the plaintext key never lives in /data.
+        write_pem_to_disk(session)
+
+        threading.Thread(target=broadcaster,         daemon=True).start()
+        threading.Thread(target=discovery_listener,  daemon=True).start()
+        threading.Thread(target=tls_server_loop, args=(session,), daemon=True).start()
+
+        print('Type "help" For Commands.')
         while True:
-            getInput(logged_in_user)        # getInput needs the session now
+            getInput(session)
