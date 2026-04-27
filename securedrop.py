@@ -1,6 +1,6 @@
 import threading
 import time
-from Crypto.Cipher import AES, PKCS1_OAEP
+from Crypto.Cipher import AES
 from Crypto.Hash import SHA256
 from Crypto.PublicKey import RSA
 from Crypto.Random import get_random_bytes
@@ -26,7 +26,6 @@ TLS_PORT       = 9999    # TCP, for mutual-TLS connections
 def broadcaster():
     """Periodically broadcast 'I have a TLS server at <host>:<port>'.
        Identity is proven later via certificate during the TLS handshake."""
-    #hostname = socket.gethostname()
     hostname = os.getenv("CLIENT_NAME", socket.gethostname())
     payload  = f"{hostname}|{TLS_PORT}".encode("utf-8")
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
@@ -189,40 +188,53 @@ def list_command(session):
 def handle_incoming_file(tls_sock, peer_email, req, session):
     contacts = load_contacts(session["password_key"])
     if peer_email not in contacts:
-        # Project: "From UA on CA to UC on CC, the transfer should not occur"
-        # because UA doesn't have UC as a contact. Silently refuse.
-        tls_sock.sendall(b'{"accept": false, "reason": "not a contact"}\n')
+        # Receiver-side authorization. Protects scenario 9 even if sender's own
+        # contact check were bypassed somehow.
+        tls_sock.sendall(b'{"accept": false, "reason": "not a mutual contact"}\n')
         return
 
-    filename   = os.path.basename(req["filename"])  # never trust paths from peer
-    size       = int(req["size"])
-    sender_seq = int(req["seq"])
+    filename     = os.path.basename(req["filename"])   # never trust paths from peer
+    size         = int(req["size"])
+    sender_seq   = int(req["seq"])
+    expected_sha = req.get("sha256", "")
 
-    print(f"\nContact '{contacts[peer_email]['name']} <{peer_email}>' is sending a file. Accept (y/n)? ", end="", flush=True)
-    answer = input().strip().lower()
-    if answer != "y":
-        tls_sock.sendall(b'{"accept": false}\n')
-        return
+    # Auto-accept: contact relationship is the authorization. A real GUI would
+    # prompt; a TUI prompt here would race with the main shell's input().
+    print(f"\nIncoming file from {contacts[peer_email]['name']} <{peer_email}>: "
+          f"{filename} ({size} bytes). Accepted automatically.", flush=True)
 
     my_seq = int.from_bytes(os.urandom(4), "big")
     tls_sock.sendall((json.dumps({"accept": True, "seq": my_seq}) + "\n").encode())
 
-    # Each chunk is: 4-byte sequence number || 4-byte length || payload
+    # Receive chunks: 4-byte seq || 4-byte length || payload. Sequence numbers
+    # mitigate replay attacks (project milestone 5 requirement).
     received = bytearray()
     expected_seq = sender_seq + 1
+    h = hashlib.sha256()
     while len(received) < size:
         header = recv_exactly(tls_sock, 8)
         seq, length = struct.unpack(">II", header)
         if seq != expected_seq:
-            print("Sequence mismatch — possible replay. Aborting.")
+            tls_sock.sendall(b'{"ok": false, "reason": "sequence mismatch"}\n')
+            print("Sequence mismatch — possible replay. Aborted.", flush=True)
             return
-        received += recv_exactly(tls_sock, length)
+        body = recv_exactly(tls_sock, length)
+        received += body
+        h.update(body)
         expected_seq += 1
+
+    # Project requirement: verify integrity BEFORE telling user it succeeded.
+    if expected_sha and h.hexdigest() != expected_sha:
+        tls_sock.sendall(b'{"ok": false, "reason": "sha256 mismatch"}\n')
+        print("Hash mismatch — file rejected.", flush=True)
+        return
 
     out_path = os.path.join(os.getcwd(), filename)
     with open(out_path, "wb") as f:
         f.write(bytes(received))
-    print(f"\nFile saved to {out_path}")
+
+    tls_sock.sendall(b'{"ok": true}\n')
+    print(f"File saved to {out_path}", flush=True)
 
 def recv_exactly(sock, n):
     buf = b""
@@ -396,18 +408,19 @@ def login():
         }
 
 def send_command(session, contact_email, filepath):
-    """Sender side of file transfer. Mutual-TLS auth + replay-resistant chunks."""
+    """Sender side. Mutual-TLS auth, SHA-256 integrity, sequence-numbered chunks."""
     if not os.path.isfile(filepath):
         print(f"File not found: {filepath}")
         return
 
     contacts = load_contacts(session["password_key"])
     if contact_email not in contacts:
-        # Project scenario 9: UA -> UC where UA doesn't have UC -> "transfer should not occur"
+        # Sender-side check. Together with the receiver-side check, this is what
+        # makes scenario 9 (UA -> UC, no contact relationship) refuse cleanly.
         print(f"{contact_email} is not in your contact list.")
         return
 
-    # Walk the discovery snapshot looking for a peer whose cert CN matches contact_email
+    # Find the peer whose cert CN matches the requested email
     with peers_lock:
         snapshot = [(h, p["port"]) for h, p in peers.items()
                     if time.time() - p["last_seen"] < 10]
@@ -421,15 +434,23 @@ def send_command(session, contact_email, filepath):
             if peer_email_from_cert(tls) == contact_email:
                 target = tls
                 break
-            tls.close()                          # wrong peer; try the next one
-        except Exception:
+            tls.close()
+        except OSError:
             continue
 
     if target is None:
+        # Scenario 8: UD is in UA's contacts but not online.
         print(f"{contact_email} is not online.")
         return
 
     try:
+        # Pre-compute the file's SHA-256 — receiver will verify after reassembly.
+        h = hashlib.sha256()
+        with open(filepath, "rb") as f:
+            for block in iter(lambda: f.read(65536), b""):
+                h.update(block)
+        file_sha256 = h.hexdigest()
+
         size   = os.path.getsize(filepath)
         my_seq = int.from_bytes(os.urandom(4), "big")
         req = {
@@ -437,10 +458,11 @@ def send_command(session, contact_email, filepath):
             "filename": os.path.basename(filepath),
             "size":     size,
             "seq":      my_seq,
+            "sha256":   file_sha256,
         }
         target.sendall((json.dumps(req) + "\n").encode("utf-8"))
 
-        # Wait for accept/reject (single line of JSON)
+        # Wait for accept/reject
         data = b""
         while not data.endswith(b"\n"):
             chunk = target.recv(1024)
@@ -450,12 +472,12 @@ def send_command(session, contact_email, filepath):
             data += chunk
         reply = json.loads(data.decode("utf-8").strip())
         if not reply.get("accept"):
-            print(f"Transfer rejected: {reply.get('reason', 'declined by user')}")
+            print(f"Transfer rejected: {reply.get('reason', 'declined')}.")
             return
 
         print("Contact has accepted the transfer request.")
 
-        # Stream the file in 64 KB chunks. Each chunk: 4-byte seq || 4-byte len || payload.
+        # Stream file in 64 KB chunks
         seq = my_seq + 1
         with open(filepath, "rb") as f:
             while True:
@@ -464,10 +486,22 @@ def send_command(session, contact_email, filepath):
                     break
                 target.sendall(struct.pack(">II", seq, len(chunk)) + chunk)
                 seq += 1
-        print("File has been successfully transferred.")
+
+        # Final ACK from receiver — only NOW do we say "success"
+        data = b""
+        while not data.endswith(b"\n"):
+            chunk = target.recv(1024)
+            if not chunk:
+                print("Peer closed connection before final ack.")
+                return
+            data += chunk
+        final = json.loads(data.decode("utf-8").strip())
+        if final.get("ok"):
+            print("File has been successfully transferred.")
+        else:
+            print(f"Transfer failed: {final.get('reason', 'unknown')}.")
     finally:
         target.close()
-
 
 def getInput(session):
     """Read a single command from the user and dispatch it."""
